@@ -443,9 +443,249 @@ function AppShell({ userEmail }) {
           {tab === "accounts" && <MonthlyAccounting data={data} persist={persist} />}
         </div>
       </div>
+      <VoiceAssistant data={data} />
     </div>
   );
 }
+
+// ---------- Voice Assistant ----------
+function normalizeDigits(str) {
+  return (str || "").replace(/\D/g, "");
+}
+function normalizeAlnum(str) {
+  return (str || "").toLowerCase().replace(/[^a-z0-9]/g, "");
+}
+
+function findTruckInQuery(query, trucks) {
+  const qDigits = normalizeDigits(query);
+  const qAlnum = normalizeAlnum(query);
+  // Prefer exact-ish alnum containment (handles full reg spoken/typed)
+  let match = trucks.find((t) => normalizeAlnum(t.reg) && qAlnum.includes(normalizeAlnum(t.reg)));
+  if (match) return match;
+  // Fall back to a digit sequence match (handles "truck number 6262")
+  if (qDigits.length >= 3) {
+    match = trucks.find((t) => normalizeDigits(t.reg).includes(qDigits));
+  }
+  return match || null;
+}
+
+function buildTruckAnswer(query, truck, data) {
+  const q = query.toLowerCase();
+  const driver = data.drivers.find((d) => d.id === truck.driverId);
+  const parts = [];
+
+  const wantsDocs = /document|insurance|permit|fitness|pollution|\brc\b|expir/.test(q);
+  const wantsDriver = /driver/.test(q);
+  const wantsRevenue = /revenue|profit|earn|report|income/.test(q);
+  const wantsFuel = /fuel|mileage/.test(q);
+  const wantsMaint = /maintenance|service|repair/.test(q);
+  const wantsFastag = /fastag|toll|balance/.test(q);
+  const wantsTrip = /trip|where|location|route/.test(q);
+  const wantsAny = wantsDocs || wantsDriver || wantsRevenue || wantsFuel || wantsMaint || wantsFastag || wantsTrip;
+
+  if (wantsDocs || !wantsAny) {
+    const docs = [
+      ["Insurance", truck.insuranceExpiry],
+      ["Fitness certificate", truck.fitnessExpiry],
+      ["Permit", truck.permitExpiry],
+      ["Pollution certificate", truck.pollutionExpiry],
+    ];
+    const docLines = docs.map(([label, date]) => {
+      const d = daysUntil(date);
+      if (d === null) return `${label} has no date on file`;
+      if (d < 0) return `${label} expired ${Math.abs(d)} days ago`;
+      if (d <= 30) return `${label} expires in ${d} days`;
+      return `${label} is valid, expires ${fmtDate(date)}`;
+    });
+    parts.push(`Documents for ${truck.reg}: ` + docLines.join(". "));
+  }
+
+  if (wantsDriver || !wantsAny) {
+    parts.push(driver
+      ? `Driver is ${driver.name}, phone ${driver.phone || "not on file"}.`
+      : `No driver is currently assigned to ${truck.reg}.`);
+  }
+
+  if (wantsTrip || !wantsAny) {
+    const ongoing = data.trips.find((t) => t.truckId === truck.id && t.status === "ongoing");
+    parts.push(ongoing
+      ? `Currently on a trip from ${ongoing.pickup} to ${ongoing.destination}.`
+      : `${truck.reg} has no ongoing trip right now.`);
+  }
+
+  if (wantsRevenue || !wantsAny) {
+    const curMonth = new Date().toISOString().slice(0, 7);
+    const trips = data.trips.filter((t) => t.truckId === truck.id && monthKey(t.date) === curMonth);
+    const fuel = data.fuel.filter((f) => f.truckId === truck.id && monthKey(f.date) === curMonth);
+    const maint = data.maintenance.filter((m) => m.truckId === truck.id && monthKey(m.date) === curMonth);
+    const revenue = trips.reduce((s, t) => s + (Number(t.freight) || 0), 0);
+    const fuelCost = fuel.reduce((s, f) => s + (Number(f.cost) || 0), 0);
+    const maintCost = maint.reduce((s, m) => s + (Number(m.cost) || 0), 0);
+    const emi = Number(truck.monthlyEmi) || 0;
+    const profit = revenue - fuelCost - maintCost - emi;
+    parts.push(`This month: ${trips.length} trips, revenue ${fmtMoney(revenue)}, fuel ${fmtMoney(fuelCost)}, maintenance ${fmtMoney(maintCost)}, EMI ${fmtMoney(emi)}, net profit ${fmtMoney(profit)}.`);
+  }
+
+  if (wantsFuel) {
+    const fuel = data.fuel.filter((f) => f.truckId === truck.id);
+    const totalFuel = fuel.reduce((s, f) => s + (Number(f.cost) || 0), 0);
+    const last = fuel.slice().sort((a, b) => (b.date || "").localeCompare(a.date || ""))[0];
+    parts.push(`Total fuel spend on record is ${fmtMoney(totalFuel)}.` + (last ? ` Last fill-up was ${fmtDate(last.date)} for ${fmtMoney(last.cost)}.` : ""));
+  }
+
+  if (wantsMaint) {
+    const maint = data.maintenance.filter((m) => m.truckId === truck.id);
+    const totalMaint = maint.reduce((s, m) => s + (Number(m.cost) || 0), 0);
+    const last = maint.slice().sort((a, b) => (b.date || "").localeCompare(a.date || ""))[0];
+    parts.push(`Total maintenance spend is ${fmtMoney(totalMaint)}.` + (last ? ` Last was ${last.type} on ${fmtDate(last.date)}.` : ""));
+  }
+
+  if (wantsFastag) {
+    if (!truck.fastagId) {
+      parts.push(`No FASTag is on file for ${truck.reg}.`);
+    } else {
+      const bal = fastagBalance(data, truck.id);
+      parts.push(`FASTag balance for ${truck.reg} is ${fmtMoney(bal)}.` + (bal < LOW_BALANCE_THRESHOLD ? " That's low, consider recharging." : ""));
+    }
+  }
+
+  return parts.join(" ");
+}
+
+function answerQuery(query, data) {
+  if (!query || !query.trim()) return "I didn't catch that. Try asking about a truck by its number.";
+  const truck = findTruckInQuery(query, data.trucks);
+  if (!truck) {
+    return "I couldn't match that to a truck in your fleet. Try including the registration number or the last few digits.";
+  }
+  return buildTruckAnswer(query, truck, data);
+}
+
+function VoiceAssistant({ data }) {
+  const [open, setOpen] = useState(false);
+  const [listening, setListening] = useState(false);
+  const [typedQuery, setTypedQuery] = useState("");
+  const [history, setHistory] = useState([]);
+  const recognitionRef = useState(() => {
+    if (typeof window === "undefined") return null;
+    const SR = window.SpeechRecognition || window.webkitSpeechRecognition;
+    return SR ? new SR() : null;
+  })[0];
+  const speechSupported = !!recognitionRef;
+
+  const speak = (text) => {
+    if (typeof window !== "undefined" && window.speechSynthesis) {
+      try {
+        window.speechSynthesis.cancel();
+        const utter = new SpeechSynthesisUtterance(text);
+        utter.rate = 1.0;
+        window.speechSynthesis.speak(utter);
+      } catch (e) {}
+    }
+  };
+
+  const runQuery = (query) => {
+    const response = answerQuery(query, data);
+    setHistory((h) => [...h, { query, response }]);
+    speak(response);
+  };
+
+  const startListening = () => {
+    if (!recognitionRef) return;
+    recognitionRef.lang = "en-IN";
+    recognitionRef.interimResults = false;
+    recognitionRef.maxAlternatives = 1;
+    recognitionRef.onstart = () => setListening(true);
+    recognitionRef.onend = () => setListening(false);
+    recognitionRef.onerror = () => setListening(false);
+    recognitionRef.onresult = (e) => {
+      const text = e.results[0][0].transcript;
+      runQuery(text);
+    };
+    try {
+      recognitionRef.start();
+    } catch (e) {}
+  };
+
+  const submitTyped = (e) => {
+    e.preventDefault();
+    if (!typedQuery.trim()) return;
+    runQuery(typedQuery);
+    setTypedQuery("");
+  };
+
+  return (
+    <>
+      <button
+        onClick={() => setOpen((o) => !o)}
+        style={{
+          position: "fixed", bottom: 24, right: 24, width: 56, height: 56, borderRadius: "50%",
+          background: listening ? C.red : C.amber, border: "none", cursor: "pointer",
+          display: "flex", alignItems: "center", justifyContent: "center",
+          boxShadow: "0 8px 24px rgba(0,0,0,0.4)", zIndex: 90, fontSize: 22,
+        }}
+        aria-label="Voice assistant"
+      >
+        🎙️
+      </button>
+
+      {open && (
+        <div
+          style={{
+            position: "fixed", bottom: 92, right: 24, width: 340, maxWidth: "calc(100vw - 48px)",
+            maxHeight: "60vh", background: C.surface, border: `1px solid ${C.border}`, borderRadius: 12,
+            boxShadow: "0 16px 40px rgba(0,0,0,0.5)", zIndex: 90, display: "flex", flexDirection: "column",
+          }}
+        >
+          <div style={{ padding: "14px 16px", borderBottom: `1px solid ${C.border}`, display: "flex", justifyContent: "space-between", alignItems: "center" }}>
+            <div>
+              <div style={{ ...disp, fontSize: 15, fontWeight: 600 }}>Fleet Assistant</div>
+              <div style={{ fontSize: 11, color: C.faint }}>Ask about any truck by number</div>
+            </div>
+            <button onClick={() => setOpen(false)} style={{ background: "none", border: "none", color: C.muted, fontSize: 18, cursor: "pointer" }}>×</button>
+          </div>
+
+          <div style={{ flex: 1, overflowY: "auto", padding: "12px 16px", display: "flex", flexDirection: "column", gap: 10 }}>
+            {history.length === 0 && (
+              <div style={{ fontSize: 12, color: C.faint }}>
+                Try: "Documents for 6262" or "Revenue report for truck 3456"
+              </div>
+            )}
+            {history.map((h, i) => (
+              <div key={i} style={{ display: "flex", flexDirection: "column", gap: 4 }}>
+                <div style={{ fontSize: 12, color: C.amber, fontWeight: 600 }}>You: {h.query}</div>
+                <div style={{ fontSize: 12.5, color: C.text, background: C.surface2, borderRadius: 6, padding: "8px 10px" }}>{h.response}</div>
+              </div>
+            ))}
+          </div>
+
+          <form onSubmit={submitTyped} style={{ padding: 12, borderTop: `1px solid ${C.border}`, display: "flex", gap: 8 }}>
+            <input
+              style={{ ...inputStyle, flex: 1, fontSize: 13 }}
+              placeholder="Type a question…"
+              value={typedQuery}
+              onChange={(e) => setTypedQuery(e.target.value)}
+            />
+            {speechSupported && (
+              <button
+                type="button"
+                onClick={startListening}
+                style={{
+                  background: listening ? C.red : C.surface2, border: `1px solid ${C.border}`, borderRadius: 6,
+                  width: 38, cursor: "pointer", color: C.text, fontSize: 15, flexShrink: 0,
+                }}
+              >
+                🎙️
+              </button>
+            )}
+            <Btn type="submit" style={{ flexShrink: 0 }}>Ask</Btn>
+          </form>
+        </div>
+      )}
+    </>
+  );
+}
+
 
 // ---------- Dashboard ----------
 function Dashboard({ data, setTab }) {
