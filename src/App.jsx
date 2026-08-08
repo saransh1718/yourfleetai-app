@@ -93,7 +93,7 @@ const mono = { fontFamily: "'JetBrains Mono', monospace" };
 
 // ---------- Storage helpers ----------
 const STORAGE_KEY = "tms-fleet-data";
-const emptyData = { trucks: [], drivers: [], trips: [], fuel: [], maintenance: [], contracts: [], contractPayments: [], staff: [], expenses: [] };
+const emptyData = { trucks: [], drivers: [], trips: [], fuel: [], maintenance: [], contracts: [], contractPayments: [], staff: [], expenses: [], income: [], fastagTransactions: [] };
 
 function uid(prefix) {
   return prefix + "_" + Math.random().toString(36).slice(2, 9);
@@ -372,6 +372,7 @@ function AppShell({ userEmail }) {
     { id: "maintenance", label: "Maintenance" },
     { id: "contracts", label: "Contracts" },
     { id: "staff", label: "Staff" },
+    { id: "fastag", label: "FASTag" },
     { id: "accounts", label: "Monthly Accounting" },
   ];
 
@@ -438,6 +439,7 @@ function AppShell({ userEmail }) {
           {tab === "maintenance" && <Maintenance data={data} persist={persist} modal={modal} setModal={setModal} />}
           {tab === "contracts" && <Contracts data={data} persist={persist} modal={modal} setModal={setModal} />}
           {tab === "staff" && <Staff data={data} persist={persist} modal={modal} setModal={setModal} />}
+          {tab === "fastag" && <FastagPage data={data} persist={persist} modal={modal} setModal={setModal} />}
           {tab === "accounts" && <MonthlyAccounting data={data} persist={persist} />}
         </div>
       </div>
@@ -792,6 +794,7 @@ function TruckModal({ item, data, onClose, onSave }) {
       location: "",
       fuelEfficiency: "",
       monthlyEmi: "",
+      fastagId: "",
       status: "active",
     }
   );
@@ -819,6 +822,7 @@ function TruckModal({ item, data, onClose, onSave }) {
           <Field label="Fuel Efficiency (km/l)"><input type="number" style={inputStyle} value={f.fuelEfficiency} onChange={set("fuelEfficiency")} /></Field>
         </div>
         <Field label="Monthly EMI (₹)"><input type="number" style={inputStyle} value={f.monthlyEmi} onChange={set("monthlyEmi")} placeholder="0 if no loan" /></Field>
+        <Field label="FASTag ID (optional)"><input style={inputStyle} value={f.fastagId} onChange={set("fastagId")} placeholder="e.g. tag number printed on the sticker" /></Field>
         <Field label="Status">
           <select style={inputStyle} value={f.status} onChange={set("status")}>
             <option value="active">Active</option>
@@ -1430,6 +1434,124 @@ function StaffModal({ item, onClose, onSave }) {
   );
 }
 
+// ---------- FASTag ----------
+const LOW_BALANCE_THRESHOLD = 300;
+
+function fastagBalance(data, truckId) {
+  return data.fastagTransactions
+    .filter((t) => t.truckId === truckId)
+    .reduce((s, t) => s + (t.type === "recharge" ? Number(t.amount) || 0 : -(Number(t.amount) || 0)), 0);
+}
+
+function FastagPage({ data, persist, modal, setModal }) {
+  const trucksWithTag = data.trucks.filter((t) => t.fastagId);
+  const trucksWithoutTag = data.trucks.filter((t) => !t.fastagId);
+
+  return (
+    <div>
+      <Header title="FASTag" subtitle="Balance and toll history per truck — logged manually" />
+
+      {trucksWithTag.length === 0 ? (
+        <Card>
+          <Empty title="No FASTags on file" hint="Add a FASTag ID to a truck (Trucks tab → Edit) to start tracking its balance here." />
+        </Card>
+      ) : (
+        <div style={{ display: "grid", gap: 12, marginBottom: trucksWithoutTag.length ? 20 : 0 }}>
+          {trucksWithTag.map((t) => {
+            const balance = fastagBalance(data, t.id);
+            const low = balance < LOW_BALANCE_THRESHOLD;
+            const history = data.fastagTransactions.filter((x) => x.truckId === t.id).slice().reverse().slice(0, 6);
+            return (
+              <Card key={t.id}>
+                <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", flexWrap: "wrap", gap: 10 }}>
+                  <div>
+                    <div style={{ display: "flex", gap: 10, alignItems: "center", marginBottom: 6, flexWrap: "wrap" }}>
+                      <Plate tone="amber">{t.reg}</Plate>
+                      <span style={{ ...mono, fontSize: 12, color: C.faint }}>Tag: {t.fastagId}</span>
+                      {low && <Plate tone="red">Low balance</Plate>}
+                    </div>
+                  </div>
+                  <div style={{ display: "flex", gap: 8, alignItems: "center" }}>
+                    <div style={{ textAlign: "right", marginRight: 6 }}>
+                      <div style={{ fontSize: 11, color: C.faint }}>Balance</div>
+                      <div style={{ ...mono, fontSize: 18, fontWeight: 700, color: low ? C.red : C.green }}>{fmtMoney(balance)}</div>
+                    </div>
+                    <Btn variant="ghost" onClick={() => setModal({ type: "fastagTxn", item: { truckId: t.id, type: "recharge" } })}>+ Recharge</Btn>
+                    <Btn variant="ghost" onClick={() => setModal({ type: "fastagTxn", item: { truckId: t.id, type: "toll" } })}>+ Toll</Btn>
+                  </div>
+                </div>
+                {history.length > 0 && (
+                  <>
+                    <RouteDivider />
+                    <div style={{ display: "grid", gap: 6 }}>
+                      {history.map((h) => (
+                        <div key={h.id} style={{ display: "flex", justifyContent: "space-between", fontSize: 12, color: C.muted, padding: "6px 10px", background: C.surface2, borderRadius: 6 }}>
+                          <span>{fmtDate(h.date)} · {h.type === "recharge" ? "Recharge" : "Toll deduction"}{h.notes ? ` — ${h.notes}` : ""}</span>
+                          <b style={{ ...mono, color: h.type === "recharge" ? C.green : C.text }}>
+                            {h.type === "recharge" ? "+" : "−"}{fmtMoney(h.amount)}
+                          </b>
+                        </div>
+                      ))}
+                    </div>
+                  </>
+                )}
+              </Card>
+            );
+          })}
+        </div>
+      )}
+
+      {trucksWithoutTag.length > 0 && (
+        <div style={{ fontSize: 12, color: C.faint }}>
+          No FASTag on file yet for: {trucksWithoutTag.map((t) => t.reg).join(", ")}
+        </div>
+      )}
+
+      {modal?.type === "fastagTxn" && (
+        <FastagTxnModal
+          truckId={modal.item.truckId}
+          defaultType={modal.item.type}
+          data={data}
+          onClose={() => setModal(null)}
+          onSave={(txn) => {
+            persist({ ...data, fastagTransactions: [...data.fastagTransactions, txn] });
+            setModal(null);
+          }}
+        />
+      )}
+    </div>
+  );
+}
+
+function FastagTxnModal({ truckId, defaultType, data, onClose, onSave }) {
+  const truck = data.trucks.find((t) => t.id === truckId);
+  const [f, setF] = useState({ id: uid("fastag"), truckId, date: new Date().toISOString().slice(0, 10), type: defaultType, amount: "", notes: "" });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  return (
+    <Modal title={`${f.type === "recharge" ? "Log Recharge" : "Log Toll Deduction"} — ${truck ? truck.reg : ""}`} onClose={onClose}>
+      <div style={{ display: "grid", gap: 12 }}>
+        <Field label="Type">
+          <select style={inputStyle} value={f.type} onChange={set("type")}>
+            <option value="recharge">Recharge (adds to balance)</option>
+            <option value="toll">Toll deduction (subtracts from balance)</option>
+          </select>
+        </Field>
+        <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+          <Field label="Date"><input type="date" style={inputStyle} value={f.date} onChange={set("date")} /></Field>
+          <Field label="Amount (₹)"><input type="number" style={inputStyle} value={f.amount} onChange={set("amount")} /></Field>
+        </div>
+        <Field label={f.type === "toll" ? "Toll plaza (optional)" : "Notes (optional)"}>
+          <input style={inputStyle} value={f.notes} onChange={set("notes")} placeholder={f.type === "toll" ? "e.g. Kherki Daula" : ""} />
+        </Field>
+        <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+          <Btn onClick={() => f.amount && onSave(f)}>Save</Btn>
+          <Btn variant="ghost" onClick={onClose}>Cancel</Btn>
+        </div>
+      </div>
+    </Modal>
+  );
+}
+
 // ---------- Monthly Accounting ----------
 function MonthlyAccounting({ data, persist }) {
   const allMonths = new Set();
@@ -1438,6 +1560,7 @@ function MonthlyAccounting({ data, persist }) {
   data.maintenance.forEach((m) => m.date && allMonths.add(monthKey(m.date)));
   data.contractPayments.forEach((p) => p.date && allMonths.add(monthKey(p.date)));
   data.expenses.forEach((e) => e.date && allMonths.add(monthKey(e.date)));
+  data.income.forEach((i) => i.date && allMonths.add(monthKey(i.date)));
   allMonths.add(new Date().toISOString().slice(0, 7));
   const monthOptions = [...allMonths].sort().reverse();
 
@@ -1449,7 +1572,8 @@ function MonthlyAccounting({ data, persist }) {
   // Income
   const tripRevenue = data.trips.filter((t) => inMonth(t.date)).reduce((s, t) => s + (Number(t.freight) || 0), 0);
   const contractReceived = data.contractPayments.filter((p) => p.direction === "received" && inMonth(p.date)).reduce((s, p) => s + (Number(p.amount) || 0), 0);
-  const totalIncome = tripRevenue + contractReceived;
+  const otherIncome = data.income.filter((i) => inMonth(i.date)).reduce((s, i) => s + (Number(i.amount) || 0), 0);
+  const totalIncome = tripRevenue + contractReceived + otherIncome;
 
   // Expenses
   const tripExpenses = data.trips.filter((t) => inMonth(t.date)).reduce((s, t) => s + (Number(t.expenses) || 0), 0);
@@ -1460,12 +1584,15 @@ function MonthlyAccounting({ data, persist }) {
   const staffSalaries = data.staff.reduce((s, x) => s + (Number(x.salaryBracket) || 0), 0);
   const contractInvestment = data.contractPayments.filter((p) => p.direction === "investment" && inMonth(p.date)).reduce((s, p) => s + (Number(p.amount) || 0), 0);
   const otherExpenses = data.expenses.filter((e) => inMonth(e.date)).reduce((s, e) => s + (Number(e.amount) || 0), 0);
-  const totalExpenses = tripExpenses + fuelCost + maintCost + truckEmis + driverSalaries + staffSalaries + contractInvestment + otherExpenses;
+  const tollDeductions = data.fastagTransactions.filter((t) => t.type === "toll" && inMonth(t.date)).reduce((s, t) => s + (Number(t.amount) || 0), 0);
+  const totalExpenses = tripExpenses + fuelCost + maintCost + truckEmis + driverSalaries + staffSalaries + contractInvestment + otherExpenses + tollDeductions;
 
   const net = totalIncome - totalExpenses;
 
   const monthExpenseEntries = data.expenses.filter((e) => inMonth(e.date)).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
   const removeExpense = (id) => persist({ ...data, expenses: data.expenses.filter((e) => e.id !== id) });
+  const monthIncomeEntries = data.income.filter((i) => inMonth(i.date)).sort((a, b) => (b.date || "").localeCompare(a.date || ""));
+  const removeIncome = (id) => persist({ ...data, income: data.income.filter((i) => i.id !== id) });
 
   return (
     <div>
@@ -1494,6 +1621,7 @@ function MonthlyAccounting({ data, persist }) {
           <div style={{ ...disp, fontSize: 15, fontWeight: 600, marginBottom: 12, color: C.green }}>INCOME</div>
           <LineItem label="Trip revenue (freight)" value={tripRevenue} />
           <LineItem label="Contract payments received" value={contractReceived} />
+          <LineItem label="Other income" value={otherIncome} />
           <RouteDivider />
           <LineItem label="Total Income" value={totalIncome} bold />
         </Card>
@@ -1506,6 +1634,7 @@ function MonthlyAccounting({ data, persist }) {
           <LineItem label="Driver salaries" value={driverSalaries} />
           <LineItem label="Staff salaries" value={staffSalaries} />
           <LineItem label="Contract investment" value={contractInvestment} />
+          <LineItem label="Toll (FASTag)" value={tollDeductions} />
           <LineItem label="Other expenses" value={otherExpenses} />
           <RouteDivider />
           <LineItem label="Total Expenses" value={totalExpenses} bold />
@@ -1533,9 +1662,36 @@ function MonthlyAccounting({ data, persist }) {
         </Card>
       </div>
 
+      <div style={{ marginTop: 22 }}>
+        <Card>
+          <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 4 }}>
+            <div>
+              <div style={{ ...disp, fontSize: 15, fontWeight: 600 }}>Other Income Log</div>
+              <div style={{ fontSize: 12, color: C.muted }}>Asset sales, refunds, interest — anything not from trips or contracts, this month</div>
+            </div>
+            <Btn variant="ghost" onClick={() => setModal({ type: "income", item: null })}>+ Log Income</Btn>
+          </div>
+          {monthIncomeEntries.length === 0 ? (
+            <div style={{ fontSize: 12, color: C.faint, padding: "14px 0 4px" }}>Nothing logged for {monthLabel(selectedMonth)} yet.</div>
+          ) : (
+            <div style={{ display: "grid", gap: 6, marginTop: 14 }}>
+              {monthIncomeEntries.map((i) => (
+                <ExpenseRow key={i.id} expense={i} onRemove={() => removeIncome(i.id)} valueColor={C.green} />
+              ))}
+            </div>
+          )}
+        </Card>
+      </div>
+
       {modal?.type === "expense" && (
         <ExpenseModalWrapper defaultDate={`${selectedMonth}-01`} onClose={() => setModal(null)} onSave={(exp) => {
           persist({ ...data, expenses: [...data.expenses, exp] });
+          setModal(null);
+        }} />
+      )}
+      {modal?.type === "income" && (
+        <IncomeModalWrapper defaultDate={`${selectedMonth}-01`} onClose={() => setModal(null)} onSave={(inc) => {
+          persist({ ...data, income: [...data.income, inc] });
           setModal(null);
         }} />
       )}
@@ -1555,12 +1711,12 @@ function LineItem({ label, value, bold }) {
 // Small wrapper so the expense log can persist without threading props
 // through MonthlyAccounting's render tree — reads/writes the same
 // storage key used everywhere else via a lightweight context-free approach.
-function ExpenseRow({ expense, onRemove }) {
+function ExpenseRow({ expense, onRemove, valueColor }) {
   return (
     <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", fontSize: 12, color: C.muted, padding: "6px 10px", background: C.surface2, borderRadius: 6 }}>
       <span>{fmtDate(expense.date)} · {expense.category || "Other"}{expense.notes ? ` — ${expense.notes}` : ""}</span>
       <div style={{ display: "flex", gap: 10, alignItems: "center" }}>
-        <b style={{ ...mono, color: C.text }}>{fmtMoney(expense.amount)}</b>
+        <b style={{ ...mono, color: valueColor || C.text }}>{fmtMoney(expense.amount)}</b>
         <button onClick={onRemove} style={{ background: "none", border: "none", color: C.faint, cursor: "pointer", fontSize: 14 }}>×</button>
       </div>
     </div>
@@ -1594,6 +1750,39 @@ function ExpenseFormBody({ defaultDate, onSave, onCancel }) {
       <Field label="Notes (optional)"><input style={inputStyle} value={f.notes} onChange={set("notes")} /></Field>
       <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
         <Btn onClick={() => f.amount && onSave(f)}>Save Expense</Btn>
+        <Btn variant="ghost" onClick={onCancel}>Cancel</Btn>
+      </div>
+    </div>
+  );
+}
+
+function IncomeModalWrapper({ defaultDate, onClose, onSave }) {
+  return (
+    <Modal title="Log Other Income" onClose={onClose}>
+      <IncomeFormBody defaultDate={defaultDate} onSave={onSave} onCancel={onClose} />
+    </Modal>
+  );
+}
+
+const INCOME_CATEGORIES = ["Asset Sale", "Interest", "Refund", "Insurance Claim", "Other"];
+
+function IncomeFormBody({ defaultDate, onSave, onCancel }) {
+  const [f, setF] = useState({ id: uid("inc"), date: defaultDate, category: INCOME_CATEGORIES[0], amount: "", notes: "" });
+  const set = (k) => (e) => setF({ ...f, [k]: e.target.value });
+  return (
+    <div style={{ display: "grid", gap: 12 }}>
+      <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: 12 }}>
+        <Field label="Date"><input type="date" style={inputStyle} value={f.date} onChange={set("date")} /></Field>
+        <Field label="Category">
+          <select style={inputStyle} value={f.category} onChange={set("category")}>
+            {INCOME_CATEGORIES.map((c) => <option key={c} value={c}>{c}</option>)}
+          </select>
+        </Field>
+      </div>
+      <Field label="Amount (₹)"><input type="number" style={inputStyle} value={f.amount} onChange={set("amount")} /></Field>
+      <Field label="Notes (optional)"><input style={inputStyle} value={f.notes} onChange={set("notes")} /></Field>
+      <div style={{ display: "flex", gap: 10, marginTop: 8 }}>
+        <Btn onClick={() => f.amount && onSave(f)}>Save Income</Btn>
         <Btn variant="ghost" onClick={onCancel}>Cancel</Btn>
       </div>
     </div>
